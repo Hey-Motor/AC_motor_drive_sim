@@ -1,0 +1,7 @@
+cd E:\C_Sim_Motor\pmsm_obs_sim_codex_1
+Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+mkdir build
+cd build
+cmake -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc ..
+cmake --build .
+.\pmsm_obs_sim.exe
