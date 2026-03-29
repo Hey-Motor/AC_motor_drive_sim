@@ -120,17 +120,14 @@ int main(void)
 
             omega_m_hat = obs.omega_e_hat / p.motor.pole_pairs;
 
-            /* 采用有传感器控制：FOC 不使用 observer 输出 */
-//             if(t<0.08)
-//             {foc_step(speed_ref, y.theta_e, y.omega_m, &adc,
-//                      &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);}
-//                      else
-//             {// observer 闭环对照：
-//             foc_step(speed_ref, obs.theta_e_hat, omega_m_hat, &adc,
-//                      &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);
-// }
-            foc_step(speed_ref, obs.theta_e_hat, omega_m_hat, &adc,
-                    &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);
+            /* 0.2s 前用真实速度/位置，0.2s 后切换到 observer 闭环 */
+            if (t < 0.2) {
+                foc_step(speed_ref, y.theta_e, y.omega_m, &adc,
+                         &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);
+            } else {
+                foc_step(speed_ref, obs.theta_e_hat, omega_m_hat, &adc,
+                         &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);
+            }
             
             inverter_apply(u_alpha_cmd, u_beta_cmd,
                            adc.ia, adc.ib, -(adc.ia + adc.ib),
