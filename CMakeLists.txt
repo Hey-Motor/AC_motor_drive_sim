@@ -7,6 +7,7 @@ add_executable(pmsm_obs_sim
     main.c
     config/params.c
     plant/pmsm_model.c
+    plant/im_model.c
     plant/inverter_avg.c
     control/transforms.c
     control/foc_controller.c
@@ -20,6 +21,7 @@ add_executable(pmsm_obs_sim
     control/observer_bernard2021.c
     control/observer_eta_only.c
     control/observer_piippo2008.c
+    control/im_observer_fo.c
     io/logger.c
 )
 
