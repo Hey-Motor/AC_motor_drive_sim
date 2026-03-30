@@ -254,5 +254,26 @@ int main(void)
         printf("save csv: %s\n", csv_name);
     }
 
+    return ret;
+}
+
+int main(void)
+{
+    const double speed_ref = 150.0;
+    const char *csv_name = "run_im_single.csv";
+    CaseResult r;
+
+    im_observer_fo_set_adapt_gain_sched_enabled(0);
+    foc_set_speed_gain_sched_enabled(0);
+    im_observer_fo_set_adapt_err_lpf_enabled(0);
+
+    printf("\n[Single Run] full sensorless, RK4 observer\n");
+    printf("gain schedule: speed_loop=OFF, adapt_law=OFF, adapt_lpf=OFF\n");
+    printf("save csv: %s\n", csv_name);
+
+    r = run_case(speed_ref, csv_name, 1, 0, 1);
+    printf("summary: speed_ref=%.1f, steady_speed_err=%.4f, wmhat_rmse=%.4f, result=%s\n",
+           speed_ref, r.speed_avg_err, r.wmhat_rmse_last1s, r.pass_speed ? "PASS" : "FAIL");
+
     return 0;
 }
