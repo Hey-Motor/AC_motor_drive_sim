@@ -2,6 +2,9 @@
 #include "../config/config.h"
 #include "transforms.h"
 #include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 extern double g_debug_time;
 static int g_speed_gain_sched_enabled = 0;
 
@@ -64,6 +67,8 @@ void foc_step(
         s->spd_int += ki_spd_use * Ts * err_spd;
         s->spd_int = clamp(s->spd_int, -p->ctrl_im.iq_limit, p->ctrl_im.iq_limit);
         iq_ref = kp_spd_use * err_spd + s->spd_int;
+        /* 直接在 iq_ref 上叠加小正弦激励，提供持续激励用于参数辨识 */
+        iq_ref += 1.5 * sin(2.0 * M_PI * 45.0 * g_debug_time);
         iq_ref = clamp(iq_ref, -p->ctrl_im.iq_limit, p->ctrl_im.iq_limit);
 
         s->flux_int += p->ctrl_im.ki_flux * Ts * err_flux;

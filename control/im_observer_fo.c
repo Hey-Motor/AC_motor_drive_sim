@@ -14,9 +14,16 @@ static double g_psi_r_beta_hat = 0.0;
 static double g_wr_hat = 0.0;
 static double g_wr_int = 0.0;
 static double g_omega_adapt_err_f = 0.0;
+static double g_rs_hat = 1.5;
+static double g_rs_int = 0.0;
+static double g_kp_rs = 0.05;
+static double g_ki_rs = 5.0;
+static double g_rs_err_f = 0.0;
+static double g_rs_nominal = 0.567;
 static int g_use_real_speed = 0;
 static int g_adapt_gain_sched_enabled = 0;
 static int g_adapt_err_lpf_enabled = 0;
+static int g_rs_adapt_enabled = 1;
 
 typedef struct {
     double di_a_hat;
@@ -46,6 +53,10 @@ void im_observer_fo_init(ObserverState *s)
     g_wr_hat = 0.0;
     g_wr_int = 0.0;
     g_omega_adapt_err_f = 0.0;
+    g_rs_hat = 1.5;
+    g_rs_int = 0.0;
+    g_rs_err_f = 0.0;
+    g_rs_nominal = 0.567;
 }
 
 void im_observer_fo_set_speed_init(double omega_e_init)
@@ -69,6 +80,17 @@ void im_observer_fo_set_adapt_err_lpf_enabled(int enabled)
     g_adapt_err_lpf_enabled = enabled ? 1 : 0;
 }
 
+void im_observer_fo_set_rs_adapt_enabled(int enabled)
+{
+    g_rs_adapt_enabled = enabled ? 1 : 0;
+}
+
+void im_observer_fo_set_rs_adapt_gains(double kp_r, double ki_r)
+{
+    g_kp_rs = kp_r;
+    g_ki_rs = ki_r;
+}
+
 void im_observer_fo_step(
     ObserverState *s,
     double Ts,
@@ -84,6 +106,7 @@ void im_observer_fo_step(
     double Tr;
     double sigma;
     double wr_model;
+    double rs_used;
     double a, b, c, d;
     double ei_a, ei_b;
     double J_psira_hat, J_psirb_hat;
@@ -91,6 +114,7 @@ void im_observer_fo_step(
     double omega_adapt_err;
     double psi_mag;
     double kp_w, ki_w;
+    double rs_adapt_err;
 
     if ((s == NULL) || (out == NULL) || (mp == NULL)) {
         return;
@@ -103,7 +127,13 @@ void im_observer_fo_step(
     sigma = 1.0 - (mp->Lm * mp->Lm) / (mp->Ls * mp->Lr);
     wr_model = g_use_real_speed ? (mp->pole_pairs * omega_m_real) : g_wr_hat;
 
-    a = -(mp->Rs / (sigma * mp->Ls) + (mp->Lm * mp->Lm) / (sigma * mp->Ls * mp->Lr * Tr));
+    rs_used = g_rs_hat;
+    if (rs_used < 0.05) {
+        rs_used = 0.05;
+    } else if (rs_used > 3.0) {
+        rs_used = 3.0;
+    }
+    a = -(rs_used / (sigma * mp->Ls) + (mp->Lm * mp->Lm) / (sigma * mp->Ls * mp->Lr * Tr));
     b = 1.0 / (sigma * mp->Ls);
     c = mp->Lm / (sigma * mp->Ls * mp->Lr * Tr);
     d = mp->Lm / Tr;
@@ -203,6 +233,26 @@ void im_observer_fo_step(
         g_wr_hat = wr_pi;
     }
 
+    {
+        double reg_den = g_i_alpha_hat * g_i_alpha_hat + g_i_beta_hat * g_i_beta_hat + 1e-4;
+        const double tau_r = 0.02;
+        const double alpha_r = Ts / (tau_r + Ts);
+        rs_adapt_err = (ei_a * g_i_alpha_hat + ei_b * g_i_beta_hat) / reg_den;
+        g_rs_err_f += alpha_r * (rs_adapt_err - g_rs_err_f);
+    }
+    if (g_rs_adapt_enabled) {
+        const double k_leak = 1.0;
+        g_rs_int += Ts * (-g_ki_rs * g_rs_err_f - k_leak * (g_rs_hat - g_rs_nominal));
+        g_rs_hat = -g_kp_rs * g_rs_err_f + g_rs_int;
+        if (g_rs_hat < 0.05) {
+            g_rs_hat = 0.05;
+            if (g_rs_int < 0.05) g_rs_int = 0.05;
+        } else if (g_rs_hat > 3.0) {
+            g_rs_hat = 3.0;
+            if (g_rs_int > 3.0) g_rs_int = 3.0;
+        }
+    }
+
     memset(out, 0, sizeof(*out));
     out->psi_alpha_hat = g_psi_r_alpha_hat;
     out->psi_beta_hat = g_psi_r_beta_hat;
@@ -214,6 +264,10 @@ void im_observer_fo_step(
     out->z21 = ei_a;
     out->z22 = ei_b;
     out->yreg = omega_adapt_err;
+    out->R_hat = g_rs_hat;
+    out->eta1_hat = g_rs_err_f;
+    out->eta2_hat = g_kp_rs;
+    out->beta_hat = g_ki_rs;
 
     s->psi_alpha_hat = out->psi_alpha_hat;
     s->psi_beta_hat = out->psi_beta_hat;
