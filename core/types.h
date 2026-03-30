@@ -20,6 +20,17 @@ typedef struct {
 } MotorParams;
 
 typedef struct {
+    int pole_pairs;
+    double Rs;
+    double Rr;
+    double Lm;
+    double Ls;
+    double Lr;
+    double J;
+    double B;
+} ImMotorParams;
+
+typedef struct {
     double Vdc;
 
     /* 非线性平均误差的饱和值，相对母线电压比例 */
@@ -52,11 +63,24 @@ typedef struct {
 } ControlParams;
 
 typedef struct {
+    double kp_id, ki_id;
+    double kp_iq, ki_iq;
+    double kp_spd, ki_spd;
+    double kp_flux, ki_flux;
+    double id_limit;
+    double iq_limit;
+    double vdq_limit;
+    double psi_r_ref;
+} ImControlParams;
+
+typedef struct {
     SimConfig sim;
     MotorParams motor;
+    ImMotorParams motor_im;
     InverterParams inverter;
     AdcParams adc;
     ControlParams ctrl;
+    ImControlParams ctrl_im;
 } Params;
 
 /* =========================
@@ -66,6 +90,10 @@ typedef struct {
 typedef struct {
     double id;
     double iq;
+    double i_alpha;
+    double i_beta;
+    double psi_r_alpha;
+    double psi_r_beta;
     double theta_m;
     double omega_m;
 } PlantState;
@@ -92,6 +120,9 @@ typedef struct {
     double theta_m, theta_e;
     double omega_m, omega_e;
     double Te;
+    double psi_r_alpha, psi_r_beta;
+    double psi_r_mag;
+    double slip_e;
 } PlantOutput;
 
 typedef struct {
@@ -169,6 +200,7 @@ typedef struct {
     double id_int;
     double iq_int;
     double spd_int;
+    double flux_int;
 } FocState;
 
 #endif

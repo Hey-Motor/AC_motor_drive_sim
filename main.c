@@ -2,30 +2,47 @@
 #include <stdio.h>
 
 #include "config/params.h"
+#include "config/config.h"
 #include "control/foc_controller.h"
-#include "control/observer_select.h"
+#include "control/im_observer_fo.h"
 #include "io/adc_model.h"
 #include "io/logger.h"
+#include "plant/im_model.h"
 #include "plant/inverter_avg.h"
 #include "plant/pmsm_model.h"
 
-/* 仅供 FOC 调试注入使用 */
 double g_debug_time = 0.0;
 
+typedef struct {
+    double kp_r;
+    double ki_r;
+} RsTuneConfig;
 
-/* 角度误差统一包到 [-pi, pi] */
-static double wrap_pm_pi(double x)
+typedef struct {
+    int pass_speed;
+    int pass_rs;
+    double speed_avg_err;
+    double wmhat_rmse_last1s;
+    double rs_avg_last1s;
+    double rs_err_last1s;
+    double rs_track_mae;
+    double t_conv_after_2s;
+    double t_conv_after_4s;
+} CaseResult;
+
+static double rs_profile(double t, double rs_nom)
 {
-    while (x > 3.14159265358979323846) {
-        x -= 2.0 * 3.14159265358979323846;
-    }
-    while (x < -3.14159265358979323846) {
-        x += 2.0 * 3.14159265358979323846;
-    }
-    return x;
+    if (t < 2.0) return rs_nom;
+    if (t < 6.0) return 1.5 * rs_nom;
+    return 0.5 * rs_nom;
 }
 
-int main(void)
+static CaseResult run_case(double speed_ref,
+                           const RsTuneConfig *cfg,
+                           const char *csv_name,
+                           double t_end,
+                           int save_csv,
+                           int print_progress)
 {
     Params p;
     PlantState x;
@@ -38,138 +55,203 @@ int main(void)
     AdcSample adc;
     CsvLogger lg;
 
-    double speed_ref = 50.0;
     double id_ref = 0.0;
     double iq_ref = 0.0;
-
-    /* 控制器算出的电压命令 */
     double u_alpha_cmd = 0.0;
     double u_beta_cmd = 0.0;
-
-    /* 下一拍真正施加到电机的平均电压 */
     double u_alpha_act_next = 0.0;
     double u_beta_act_next = 0.0;
+    double omega_m_avg_last_1s = 0.0;
+    double rs_hat_avg_last_1s = 0.0;
+    double rs_abs_err_sum = 0.0;
+    int rs_err_count = 0;
+    int avg_count = 0;
+    double wmhat_err_sq_sum = 0.0;
+    double rs_nom = 0.0;
+    double conv_hold_2s = 0.0;
+    double conv_hold_4s = 0.0;
 
-    /* 收敛评估统计（t >= 1.0s） */
-    double max_abs_theta_err_e_post1s = 0.0;
-    double max_abs_omega_err_m_post1s = 0.0;
+    CaseResult ret = {0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0};
 
     params_load_default(&p);
-    pmsm_init(&x);
+    rs_nom = p.motor_im.Rs;
+    p.sim.t_end = t_end;
+    im_init(&x);
     foc_init(&foc);
-    observer_init(&obs_state);
 
+    im_observer_fo_init(&obs_state);
+    im_observer_fo_set_speed_init(speed_ref * p.motor_im.pole_pairs);
+    im_observer_fo_set_use_real_speed(0);
+    im_observer_fo_set_adapt_gain_sched_enabled(0);
+    im_observer_fo_set_adapt_err_lpf_enabled(0);
+    im_observer_fo_set_rs_adapt_enabled(1);
+    im_observer_fo_set_rs_adapt_gains(cfg->kp_r, cfg->ki_r);
+
+    foc_set_speed_gain_sched_enabled(0);
     u.u_alpha = 0.0;
     u.u_beta = 0.0;
     u.T_load = 0.0;
 
-    pmsm_get_output(&x, &u, &p.motor, &y);
+    im_get_output(&x, &u, &p.motor_im, &y);
 
-    if (!logger_open(&lg, "run.csv")) {
-        printf("failed to open run.csv\n");
-        return 1;
+    if (save_csv) {
+        if (!logger_open(&lg, csv_name)) {
+            printf("failed to open %s\n", csv_name);
+            return ret;
+        }
     }
-
-    printf("t,omega_m,omega_e,omega_m_hat,omega_e_hat,theta_err_e,omega_err_m\n");
 
     {
         int total_steps = (int)(p.sim.t_end / p.sim.Ts_ctrl);
+        int print_decim = (int)(0.2 / p.sim.Ts_ctrl);
+        if (print_decim < 1) {
+            print_decim = 1;
+        }
 
         for (int k = 0; k < total_steps; ++k) {
             double t = k * p.sim.Ts_ctrl;
             double omega_m_hat;
-            double theta_err_e;
-            double omega_err_m;
+            double rs_true;
 
             g_debug_time = t;
+            u.T_load = 0.0;
+            rs_true = rs_profile(t, rs_nom);
+            /* 若不想启用变Rs工况，可改为：rs_true = rs_nom; */
+            p.motor_im.Rs = rs_true;
 
-            if(t>3)
-                u.T_load = 2.0;
-
-            /* 固定速度参考：50 rad/s (mechanical) */
-            speed_ref = 20.0;
-
-            /*
-             * 按要求注释掉 Rs 随时间变化逻辑：
-             * if (t < 5.0) { p.motor.Rs = 1.025; }
-             * else if (t < 10.0) { p.motor.Rs = 2.5; }
-             * else { p.motor.Rs = 3.5; }
-             */
-
-            /* 单采单更时序：本拍开始施加上一拍锁存的实际电压 */
             u.u_alpha = u_alpha_act_next;
             u.u_beta = u_beta_act_next;
 
             for (int n = 0; n < p.sim.substeps; ++n) {
-                pmsm_step_rk4(&x, &u, &p.motor, p.sim.dt_plant);
+                im_step_rk4(&x, &u, &p.motor_im, p.sim.dt_plant);
             }
 
-            pmsm_get_output(&x, &u, &p.motor, &y);
-
+            im_get_output(&x, &u, &p.motor_im, &y);
             adc_sample_currents(y.ia, y.ib, &p.adc, &adc);
 
-            /*
-             * 本阶段说明：
-             * 1) 只实现 Piippo2008 基础 adaptive observer；
-             * 2) HF injection 后续再做；
-             * 3) 当前 FOC 由传感器/真值驱动，observer 仅用于独立评估。
-             */
-            observer_set_debug_truth(y.theta_e, y.omega_e);
-            observer_step(&obs_state, p.sim.Ts_ctrl, u.u_alpha, u.u_beta,
-                          adc.i_alpha, adc.i_beta, &obs);
+            im_observer_fo_step(&obs_state, p.sim.Ts_ctrl, u.u_alpha, u.u_beta,
+                                adc.i_alpha, adc.i_beta, &p.motor_im, y.omega_m, &obs);
 
-            omega_m_hat = obs.omega_e_hat / p.motor.pole_pairs;
+            omega_m_hat = obs.omega_e_hat / p.motor_im.pole_pairs;
 
-            /* 采用有传感器控制：FOC 不使用 observer 输出 */
-//             if(t<0.08)
-//             {foc_step(speed_ref, y.theta_e, y.omega_m, &adc,
-//                      &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);}
-//                      else
-//             {// observer 闭环对照：
-//             foc_step(speed_ref, obs.theta_e_hat, omega_m_hat, &adc,
-//                      &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);
-// }
+            if (print_progress && ((k % print_decim) == 0)) {
+                printf("t=%.3f s, speed_ref=%.1f, speed_real=%.3f, speed_hat=%.3f, Rs_true=%.4f, Rs_hat=%.4f\n",
+                       t, speed_ref, y.omega_m, omega_m_hat, rs_true, obs.R_hat);
+            }
+
             foc_step(speed_ref, obs.theta_e_hat, omega_m_hat, &adc,
-                    &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);
-            
+                     &p, &foc, &u_alpha_cmd, &u_beta_cmd, &id_ref, &iq_ref);
+
             inverter_apply(u_alpha_cmd, u_beta_cmd,
                            adc.ia, adc.ib, -(adc.ia + adc.ib),
                            &p.inverter,
                            &u_alpha_act_next, &u_beta_act_next);
 
-            theta_err_e = wrap_pm_pi(obs.theta_e_hat - y.theta_e);
-            omega_err_m = omega_m_hat - y.omega_m;
-
-            if (t >= 1.0) {
-                if (fabs(theta_err_e) > max_abs_theta_err_e_post1s) {
-                    max_abs_theta_err_e_post1s = fabs(theta_err_e);
-                }
-                if (fabs(omega_err_m) > max_abs_omega_err_m_post1s) {
-                    max_abs_omega_err_m_post1s = fabs(omega_err_m);
-                }
+            if (t >= (p.sim.t_end - 1.0)) {
+                double e = omega_m_hat - y.omega_m;
+                omega_m_avg_last_1s += y.omega_m;
+                rs_hat_avg_last_1s += obs.R_hat;
+                wmhat_err_sq_sum += e * e;
+                avg_count += 1;
             }
+            if (t >= 2.0) {
+                double rs_abs_err = fabs(obs.R_hat - rs_true);
+                rs_abs_err_sum += rs_abs_err;
+                rs_err_count += 1;
 
-            logger_write(&lg, t, speed_ref, id_ref, iq_ref,
-                         u_alpha_cmd, u_beta_cmd, u_alpha_act_next, u_beta_act_next,
-                         &y, &adc, &obs, theta_err_e, u.T_load);
+                if (t >= 2.0 && t < 6.0 && ret.t_conv_after_2s < 0.0) {
+                    conv_hold_2s = (rs_abs_err <= 0.08) ? (conv_hold_2s + p.sim.Ts_ctrl) : 0.0;
+                    if (conv_hold_2s >= 0.2) {
+                        ret.t_conv_after_2s = t - conv_hold_2s + p.sim.Ts_ctrl;
+                    }
+                } else if (t >= 6.0 && ret.t_conv_after_4s < 0.0) {
+                    conv_hold_4s = (rs_abs_err <= 0.08) ? (conv_hold_4s + p.sim.Ts_ctrl) : 0.0;
+                    if (conv_hold_4s >= 0.2) {
+                        ret.t_conv_after_4s = t - conv_hold_4s + p.sim.Ts_ctrl;
+                    }
+                }
+            } 
 
-            if ((k % 100) == 0) {
-                printf("t=%.4f,wm=%.4f,we=%.4f,wm_hat=%.4f,we_hat=%.4f,theta_err_e=%.4f,omega_err_m=%.4f\n",
-                       t, y.omega_m, y.omega_e, omega_m_hat, obs.omega_e_hat,
-                       theta_err_e, omega_err_m);
+            if (save_csv) {
+                logger_write(&lg, t, speed_ref, id_ref, iq_ref,
+                             u_alpha_cmd, u_beta_cmd, u_alpha_act_next, u_beta_act_next,
+                             &y, &adc, &obs, 0.0, u.T_load);
             }
         }
     }
 
-    logger_close(&lg);
+    if (save_csv) {
+        logger_close(&lg);
+    }
 
-    printf("post_1s_max_abs_omega_err_m=%.6f (threshold 5.0)\n", max_abs_omega_err_m_post1s);
-    printf("post_1s_max_abs_theta_err_e=%.6f (threshold 0.5)\n", max_abs_theta_err_e_post1s);
+    if (avg_count > 0) {
+        double omega_avg = omega_m_avg_last_1s / (double)avg_count;
+        double rs_avg = rs_hat_avg_last_1s / (double)avg_count;
+        ret.speed_avg_err = omega_avg - speed_ref;
+        ret.wmhat_rmse_last1s = sqrt(wmhat_err_sq_sum / (double)avg_count);
+        ret.rs_avg_last1s = rs_avg;
+        ret.rs_err_last1s = rs_avg - p.motor_im.Rs;
+        ret.rs_track_mae = (rs_err_count > 0) ? (rs_abs_err_sum / (double)rs_err_count) : 0.0;
 
-    if ((max_abs_omega_err_m_post1s < 5.0) && (max_abs_theta_err_e_post1s < 0.5)) {
-        printf("convergence_check=PASS\n");
-    } else {
-        printf("convergence_check=FAIL\n");
+        ret.pass_speed = (ret.speed_avg_err < 3.0 && ret.speed_avg_err > -3.0) ? 1 : 0;
+        ret.pass_rs = (ret.rs_track_mae <= 0.08) ? 1 : 0;
+    }
+
+    return ret;
+}
+
+int main(void)
+{
+    const double speed_ref = 150.0;
+    const char *csv_name = "run_im_var_rs.csv";
+    const double kp_list[] = {0.02, 0.05, 0.10, 0.20, 0.50};
+    const double ki_list[] = {0.5, 1.0, 2.0, 5.0, 10.0};
+    const int nkp = (int)(sizeof(kp_list) / sizeof(kp_list[0]));
+    const int nki = (int)(sizeof(ki_list) / sizeof(ki_list[0]));
+    RsTuneConfig best_cfg = {kp_list[0], ki_list[0]};
+    CaseResult best = {0, 0, 0.0, 0.0, 0.0, 1e9};
+
+    printf("\n[Var Rs Sweep] full sensorless DFOC (RK4 observer with Rs_hat in observer model)\n");
+    printf("criterion: Rs tracking MAE (t>=2s) <= 0.08 ohm\n");
+
+    for (int i = 0; i < nkp; ++i) {
+        for (int j = 0; j < nki; ++j) {
+            RsTuneConfig cfg = {kp_list[i], ki_list[j]};
+            CaseResult r = run_case(speed_ref, &cfg, 0, 2.0, 0, 0);
+            printf("sweep: kp_r=%.3f, ki_r=%.3f -> Rs_hat=%.4f, Rs_err=%.4f, speed_err=%.4f\n",
+                   cfg.kp_r, cfg.ki_r, r.rs_avg_last1s, r.rs_err_last1s, r.speed_avg_err);
+            if (fabs(r.rs_err_last1s) < fabs(best.rs_err_last1s)) {
+                best = r;
+                best_cfg = cfg;
+            }
+        }
+    }
+
+    printf("\n[Best Rs adaptation config] kp_r=%.3f, ki_r=%.3f\n",
+           best_cfg.kp_r, best_cfg.ki_r);
+
+    {
+        CaseResult final_result = run_case(speed_ref, &best_cfg, csv_name, 10.0, 1, 1);
+        printf("var-Rs summary: speed_ref=%.1f, speed_err=%.4f, wmhat_rmse=%.4f, Rs_hat_last1s=%.4f, Rs_err_last1s=%.4f, Rs_track_mae=%.4f, speed=%s, Rs=%s\n",
+               speed_ref,
+               final_result.speed_avg_err,
+               final_result.wmhat_rmse_last1s,
+               final_result.rs_avg_last1s,
+               final_result.rs_err_last1s,
+               final_result.rs_track_mae,
+               final_result.pass_speed ? "PASS" : "FAIL",
+               final_result.pass_rs ? "PASS" : "FAIL");
+        if (final_result.t_conv_after_2s >= 0.0) {
+            printf("Rs convergence after 2s switch: converged at t=%.3f s\n", final_result.t_conv_after_2s);
+        } else {
+            printf("Rs convergence after 2s switch: NOT converged within [2,6)s\n");
+        }
+        if (final_result.t_conv_after_4s >= 0.0) {
+            printf("Rs convergence after 6s switch: converged at t=%.3f s\n", final_result.t_conv_after_4s);
+        } else {
+            printf("Rs convergence after 6s switch: NOT converged within [6,10]s\n");
+        }
+        printf("save csv: %s\n", csv_name);
     }
 
     return 0;
