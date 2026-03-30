@@ -3,7 +3,7 @@
 #include "transforms.h"
 #include <math.h>
 extern double g_debug_time;
-static int g_speed_gain_sched_enabled = 1;
+static int g_speed_gain_sched_enabled = 0;
 
 static double clamp(double x, double xmin, double xmax)
 {

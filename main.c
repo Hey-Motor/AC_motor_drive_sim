@@ -22,7 +22,8 @@ typedef struct {
 static CaseResult run_case(double speed_ref,
                            const char *csv_name,
                            int full_sensorless,
-                           int observer_use_real_speed)
+                           int observer_use_real_speed,
+                           int print_progress)
 {
     Params p;
     PlantState x;
@@ -68,6 +69,10 @@ static CaseResult run_case(double speed_ref,
 
     {
         int total_steps = (int)(p.sim.t_end / p.sim.Ts_ctrl);
+        int print_decim = (int)(0.2 / p.sim.Ts_ctrl);
+        if (print_decim < 1) {
+            print_decim = 1;
+        }
 
         for (int k = 0; k < total_steps; ++k) {
             double t = k * p.sim.Ts_ctrl;
@@ -90,6 +95,11 @@ static CaseResult run_case(double speed_ref,
                                 adc.i_alpha, adc.i_beta, &p.motor_im, y.omega_m, &obs);
 
             omega_m_hat = obs.omega_e_hat / p.motor_im.pole_pairs;
+
+            if (print_progress && ((k % print_decim) == 0)) {
+                printf("t=%.3f s, speed_ref=%.1f, speed_real=%.3f, speed_hat=%.3f\n",
+                       t, speed_ref, y.omega_m, omega_m_hat);
+            }
 
             if (full_sensorless) {
                 foc_step(speed_ref, obs.theta_e_hat, omega_m_hat, &adc,
@@ -131,121 +141,21 @@ static CaseResult run_case(double speed_ref,
 
 int main(void)
 {
-    const double refs[] = {10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0};
-    int first_fail = -1;
+    const double speed_ref = 150.0;
+    const char *csv_name = "run_im_single.csv";
+    CaseResult r;
 
-    im_observer_fo_set_adapt_gain_sched_enabled(1);
-    foc_set_speed_gain_sched_enabled(1);
+    im_observer_fo_set_adapt_gain_sched_enabled(0);
+    foc_set_speed_gain_sched_enabled(0);
     im_observer_fo_set_adapt_err_lpf_enabled(0);
 
-    printf("\n[Task1] Full sensorless + RK4 observer (10~90 rad/s)\n");
-    for (int i = 0; i < (int)(sizeof(refs) / sizeof(refs[0])); ++i) {
-        char name_buf[64];
-        CaseResult r;
-        snprintf(name_buf, sizeof(name_buf), "run_im_ref%.0f_full_sensorless_rk4.csv", refs[i]);
-        r = run_case(refs[i], name_buf, 1, 0);
-        printf("rk4_full_ref%.0f: speed_err=%.4f, rmse=%.4f, result=%s\n",
-               refs[i], r.speed_avg_err, r.wmhat_rmse_last1s, r.pass_speed ? "PASS" : "FAIL");
-        if ((!r.pass_speed) && first_fail < 0) {
-            first_fail = i;
-        }
-    }
-    if (first_fail < 0) {
-        printf("rk4_full_scan: PASS up to 90 rad/s\n");
-    } else {
-        printf("rk4_full_scan: first FAIL at %.1f rad/s\n", refs[first_fail]);
-    }
+    printf("\n[Single Run] full sensorless, RK4 observer\n");
+    printf("gain schedule: speed_loop=OFF, adapt_law=OFF, adapt_lpf=OFF\n");
+    printf("save csv: %s\n", csv_name);
 
-    {
-        double rated_mech_ref = 2.0 * 3.14159265358979323846 * 50.0 / 2.0; /* rated electrical 50Hz, pole_pairs=2 */
-        CaseResult r;
-        printf("\n[Task2] With speed sensor, observer uses real speed (rated speed test)\n");
-        r = run_case(rated_mech_ref,
-                     "run_im_rated_speed_sensor_mode.csv",
-                     0,  /* speed loop uses real speed */
-                     1); /* observer uses real speed */
-        printf("rated_sensor_mode: ref=%.4f, speed_err=%.4f, rmse=%.4f, result=%s\n",
-               rated_mech_ref, r.speed_avg_err, r.wmhat_rmse_last1s, r.pass_speed ? "PASS" : "FAIL");
-    }
-
-    {
-        typedef struct {
-            const char *tag;
-            int adapt_sched_on;
-            int speed_sched_on;
-            int adapt_lpf_on;
-        } AblationCfg;
-
-        const AblationCfg cfgs[] = {
-            {"none",               0, 0, 0},
-            {"adapt_sched_only",   1, 0, 0},
-            {"speed_sched_only",   0, 1, 0},
-            {"adapt_lpf_only",     0, 0, 1},
-            {"all_three",          1, 1, 1},
-            {"current_default",    1, 1, 0}
-        };
-
-        printf("\n[Task3] 150 rad/s full-sensorless ablation\n");
-        printf("pass criterion: steady-state speed error in last 1s within +/-3 rad/s\n");
-
-        for (int i = 0; i < (int)(sizeof(cfgs) / sizeof(cfgs[0])); ++i) {
-            char name_buf[96];
-            CaseResult r;
-
-            im_observer_fo_set_adapt_gain_sched_enabled(cfgs[i].adapt_sched_on);
-            foc_set_speed_gain_sched_enabled(cfgs[i].speed_sched_on);
-            im_observer_fo_set_adapt_err_lpf_enabled(cfgs[i].adapt_lpf_on);
-
-            snprintf(name_buf, sizeof(name_buf), "run_im_150_ablation_%s.csv", cfgs[i].tag);
-            r = run_case(150.0, name_buf, 1, 0);
-
-            printf("ablation %-16s | adapt_sched=%d speed_sched=%d adapt_lpf=%d"
-                   " | speed_err=%.4f rmse=%.4f | pass150=%s\n",
-                   cfgs[i].tag,
-                   cfgs[i].adapt_sched_on,
-                   cfgs[i].speed_sched_on,
-                   cfgs[i].adapt_lpf_on,
-                   r.speed_avg_err,
-                   r.wmhat_rmse_last1s,
-                   r.pass_speed ? "YES" : "NO");
-        }
-    }
-
-    {
-        const double scan_start = 100.0;
-        const double scan_end = 300.0;
-        const double scan_step = 10.0;
-        double max_pass_ref = 0.0;
-        int has_fail = 0;
-
-        printf("\n[Task4] Full-sensorless max-speed scan with current default setup\n");
-        im_observer_fo_set_adapt_gain_sched_enabled(1);
-        foc_set_speed_gain_sched_enabled(1);
-        im_observer_fo_set_adapt_err_lpf_enabled(0);
-
-        for (double ref = scan_start; ref <= scan_end + 1e-9; ref += scan_step) {
-            char name_buf[96];
-            CaseResult r;
-            snprintf(name_buf, sizeof(name_buf), "run_im_maxscan_ref%.0f.csv", ref);
-            r = run_case(ref, name_buf, 1, 0);
-
-            printf("maxscan ref=%.0f | speed_err=%.4f rmse=%.4f | result=%s\n",
-                   ref, r.speed_avg_err, r.wmhat_rmse_last1s, r.pass_speed ? "PASS" : "FAIL");
-
-            if (r.pass_speed) {
-                max_pass_ref = ref;
-            } else {
-                has_fail = 1;
-                break;
-            }
-        }
-
-        if (has_fail) {
-            printf("maxscan summary: max PASS reference = %.0f rad/s\n", max_pass_ref);
-        } else {
-            printf("maxscan summary: PASS up to %.0f rad/s (scan limit)\n", scan_end);
-        }
-    }
+    r = run_case(speed_ref, csv_name, 1, 0, 1);
+    printf("summary: speed_ref=%.1f, steady_speed_err=%.4f, wmhat_rmse=%.4f, result=%s\n",
+           speed_ref, r.speed_avg_err, r.wmhat_rmse_last1s, r.pass_speed ? "PASS" : "FAIL");
 
     return 0;
 }

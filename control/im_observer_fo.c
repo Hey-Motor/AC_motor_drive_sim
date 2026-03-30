@@ -15,7 +15,7 @@ static double g_wr_hat = 0.0;
 static double g_wr_int = 0.0;
 static double g_omega_adapt_err_f = 0.0;
 static int g_use_real_speed = 0;
-static int g_adapt_gain_sched_enabled = 1;
+static int g_adapt_gain_sched_enabled = 0;
 static int g_adapt_err_lpf_enabled = 0;
 
 typedef struct {
