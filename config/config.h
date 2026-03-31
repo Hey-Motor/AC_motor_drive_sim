@@ -9,10 +9,16 @@
 #define LOG_DECIM           1         /* 每个控制周期都记录一次 */
 
 /* =========================
- * 电机类型开关
+ * 电机/对象模型类型
+ * ========================= */
+#define MOTOR_TYPE_PMSM     0
+#define MOTOR_TYPE_IM       1
+#define MOTOR_TYPE_DEFAULT  MOTOR_TYPE_IM
+
+/* PMSM 子类型开关（仅在 MOTOR_TYPE_PMSM 时生效）
  * 1: IPMSM
  * 0: SPMSM
- * ========================= */
+ */
 #define USE_IPMSM           1
 
 /* =========================

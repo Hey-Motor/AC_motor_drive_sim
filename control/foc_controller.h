@@ -4,6 +4,7 @@
 #include "../core/types.h"
 
 void foc_init(FocState *s);
+void foc_set_speed_gain_sched_enabled(int enabled);
 
 void foc_step(
     double speed_ref,
